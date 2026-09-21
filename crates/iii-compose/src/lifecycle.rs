@@ -1418,13 +1418,13 @@ async fn resolve_config(
     let name = container.resolved_config_name(ctx.project_namespace, key)?;
     if container.config_name.is_none() {
         let legacy = crate::configuration::legacy_config_name(ctx.project_namespace, key);
-        let missing = ctx.engine.migrate_config(&legacy, &name).await?;
+        ctx.engine.migrate_config(&legacy, &name).await?;
         // Pre-namespace installations used the container key directly. Only
         // the default namespace may adopt it, and never steal a name another
-        // container in this project explicitly owns. The authority checks the
-        // destination again, so concurrent creation still wins without writes.
-        if missing
-            && ctx.project_namespace == "default"
+        // container in this project explicitly owns. The bare legacy source
+        // wins even over a destination created by an earlier Compose version.
+        // The authority archives the source after publishing the destination.
+        if ctx.project_namespace == "default"
             && !ctx
                 .file
                 .containers

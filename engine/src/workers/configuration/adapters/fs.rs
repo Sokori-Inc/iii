@@ -142,8 +142,7 @@ impl FsAdapter {
         let mut moved = 0usize;
         while let Ok(Some(entry)) = read_dir.next_entry().await {
             let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some(FILE_EXTENSION)
-            {
+            if !path.is_file() || !Self::is_config_path(&path) {
                 continue;
             }
             let Some(name) = path.file_name() else {
@@ -182,6 +181,13 @@ impl FsAdapter {
         }
     }
 
+    fn is_config_path(path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        name.ends_with(".yaml") && !name.ends_with(".bak.yaml") && !name.ends_with(".bkup.yaml")
+    }
+
     async fn load_directory(dir: &Path) -> anyhow::Result<HashMap<String, ConfigurationEntry>> {
         let mut entries = HashMap::new();
         let mut read_dir = tokio::fs::read_dir(dir).await?;
@@ -190,7 +196,7 @@ impl FsAdapter {
             if !path.is_file() {
                 continue;
             }
-            if path.extension().and_then(|e| e.to_str()) != Some(FILE_EXTENSION) {
+            if !Self::is_config_path(&path) {
                 continue;
             }
             match Self::read_entry(&path).await {
@@ -237,12 +243,166 @@ impl FsAdapter {
     /// the expected layout.
     #[cfg(test)]
     fn id_from_path(path: &Path) -> Option<String> {
+        if !Self::is_config_path(path) {
+            return None;
+        }
         let file = path.file_name()?.to_str()?;
         let stripped = file.strip_suffix(&format!(".{}", FILE_EXTENSION))?;
         if stripped.is_empty() {
             return None;
         }
         Some(stripped.to_string())
+    }
+}
+
+impl FsAdapter {
+    async fn migrate_entry(
+        &self,
+        from_id: &str,
+        to_id: &str,
+    ) -> anyhow::Result<ConfigurationMigrateResult> {
+        use std::io::Write;
+        let mut cache = self.cache.write().await;
+        let source = self.entry_path(from_id);
+        let target = self.entry_path(to_id);
+        // No await after taking the lock: cancellation cannot interrupt the
+        // short disk/cache commit sequence. The watcher takes the same lock.
+        let read = |path: &Path, id: &str| -> anyhow::Result<Option<ConfigurationEntry>> {
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+            let mut entry: ConfigurationEntry = serde_yaml::from_slice(&bytes)?;
+            anyhow::ensure!(
+                entry.id == id,
+                "configuration filename/internal id mismatch for '{id}'"
+            );
+            if entry.schema.is_null()
+                && let Some(cached) = cache.get(id)
+            {
+                entry.schema = cached.schema.clone();
+            }
+            Ok(Some(entry))
+        };
+        let prior = read(&target, to_id)?;
+        if let Some(entry) = &prior
+            && from_id == to_id
+        {
+            cache.insert(to_id.to_string(), entry.clone());
+            return Ok(ConfigurationMigrateResult {
+                action: MigrateAction::Preserved,
+                entry: Some(entry.clone()),
+            });
+        }
+        anyhow::ensure!(
+            prior.is_some() || !cache.contains_key(to_id),
+            "configuration destination disappeared from disk; retry after reconciliation"
+        );
+        let original = match std::fs::read(&source) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::ensure!(
+                    !cache.contains_key(from_id),
+                    "configuration source disappeared from disk; refusing to discard cached state"
+                );
+                if let Some(entry) = &prior {
+                    cache.insert(to_id.to_string(), entry.clone());
+                }
+                return Ok(ConfigurationMigrateResult {
+                    action: if prior.is_some() {
+                        MigrateAction::Preserved
+                    } else {
+                        MigrateAction::Missing
+                    },
+                    entry: prior,
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut entry: ConfigurationEntry = serde_yaml::from_slice(&original)?;
+        anyhow::ensure!(
+            entry.id == from_id || entry.id == to_id,
+            "configuration filename/internal id mismatch for '{from_id}'"
+        );
+        if entry.schema.is_null()
+            && let Some(cached) = cache.get(&entry.id)
+        {
+            entry.schema = cached.schema.clone();
+        }
+        // A partially migrated file may already carry the destination id.
+        // Do not invent a source cache entry with a mismatched internal id.
+        if entry.id == from_id {
+            cache.insert(from_id.to_string(), entry.clone());
+        }
+        let mut document: serde_yaml::Value = serde_yaml::from_slice(&original)?;
+        let map = document
+            .as_mapping_mut()
+            .ok_or_else(|| anyhow::anyhow!("configuration must be a mapping"))?;
+        map.insert("id".into(), to_id.into());
+        // Keep unknown document fields and persist the live schema for restart.
+        if !entry.schema.is_null() {
+            map.insert("schema".into(), serde_yaml::to_value(&entry.schema)?);
+        }
+        entry.id = to_id.to_string();
+        let yaml = serde_yaml::to_string(&document)?;
+        let temporary = self
+            .directory
+            .join(format!(".migration-{}.tmp", uuid::Uuid::new_v4()));
+        let persist = (|| -> anyhow::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            #[cfg(test)]
+            self.fail_migration_at("write")?;
+            let mut file = options.open(&temporary)?;
+            file.write_all(yaml.as_bytes())?;
+            file.sync_all()?;
+            #[cfg(test)]
+            self.fail_migration_at("publish")?;
+            std::fs::rename(&temporary, &target)?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&temporary);
+        persist?;
+        cache.insert(to_id.to_string(), entry.clone());
+        #[cfg(unix)]
+        std::fs::File::open(&self.directory)?.sync_all()?;
+        // Once target publication succeeds, any cleanup error leaves TWO valid
+        // copies. Report failure (never first boot) and reconcile both caches.
+        anyhow::ensure!(
+            std::fs::read(&source)? == original,
+            "configuration source changed during migration; both copies retained"
+        );
+        let backup = source.with_extension("yaml.bak");
+        #[cfg(test)]
+        self.fail_migration_at("backup")?;
+        // Publish the original bytes without replacing any previous backup.
+        // An identical backup permits recovery after interrupted cleanup.
+        match std::fs::hard_link(&source, &backup) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::ensure!(
+                    std::fs::read(&backup)? == original,
+                    "existing backup differs; preserve or relocate it before retrying migration"
+                );
+            }
+            Err(err) => return Err(err.into()),
+        }
+        #[cfg(unix)]
+        std::fs::File::open(&self.directory)?.sync_all()?;
+        #[cfg(test)]
+        self.fail_migration_at("delete")?;
+        std::fs::remove_file(&source)?;
+        cache.remove(from_id);
+        Ok(ConfigurationMigrateResult {
+            action: MigrateAction::Migrated,
+            entry: Some(entry),
+        })
     }
 }
 
@@ -283,119 +443,7 @@ impl ConfigurationAdapter for FsAdapter {
         from_id: &str,
         to_id: &str,
     ) -> anyhow::Result<ConfigurationMigrateResult> {
-        use std::io::Write;
-        let mut cache = self.cache.write().await;
-        let source = self.entry_path(from_id);
-        let target = self.entry_path(to_id);
-        // No await after taking the lock: cancellation cannot interrupt the
-        // short disk/cache commit sequence. The watcher takes the same lock.
-        let read = |path: &Path, id: &str| -> anyhow::Result<Option<ConfigurationEntry>> {
-            let bytes = match std::fs::read(path) {
-                Ok(bytes) => bytes,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(e.into()),
-            };
-            let mut entry: ConfigurationEntry = serde_yaml::from_slice(&bytes)?;
-            anyhow::ensure!(
-                entry.id == id,
-                "configuration filename/internal id mismatch for '{id}'"
-            );
-            if entry.schema.is_null()
-                && let Some(cached) = cache.get(id)
-            {
-                entry.schema = cached.schema.clone();
-            }
-            Ok(Some(entry))
-        };
-        if let Some(entry) = read(&target, to_id)? {
-            cache.insert(to_id.to_string(), entry.clone());
-            return Ok(ConfigurationMigrateResult {
-                action: MigrateAction::Preserved,
-                entry: Some(entry),
-            });
-        }
-        anyhow::ensure!(
-            !cache.contains_key(to_id),
-            "configuration destination disappeared from disk; retry after reconciliation"
-        );
-        let original = match std::fs::read(&source) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                anyhow::ensure!(
-                    !cache.contains_key(from_id),
-                    "configuration source disappeared from disk; refusing to discard cached state"
-                );
-                return Ok(ConfigurationMigrateResult {
-                    action: MigrateAction::Missing,
-                    entry: None,
-                });
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let mut entry: ConfigurationEntry = serde_yaml::from_slice(&original)?;
-        anyhow::ensure!(
-            entry.id == from_id,
-            "configuration filename/internal id mismatch for '{from_id}'"
-        );
-        if entry.schema.is_null()
-            && let Some(cached) = cache.get(from_id)
-        {
-            entry.schema = cached.schema.clone();
-        }
-        cache.insert(from_id.to_string(), entry.clone());
-        let mut document: serde_yaml::Value = serde_yaml::from_slice(&original)?;
-        let map = document
-            .as_mapping_mut()
-            .ok_or_else(|| anyhow::anyhow!("configuration must be a mapping"))?;
-        map.insert("id".into(), to_id.into());
-        // Keep unknown document fields and persist the live schema for restart.
-        if !entry.schema.is_null() {
-            map.insert("schema".into(), serde_yaml::to_value(&entry.schema)?);
-        }
-        entry.id = to_id.to_string();
-        let yaml = serde_yaml::to_string(&document)?;
-        let temporary = self
-            .directory
-            .join(format!(".migration-{}.tmp", uuid::Uuid::new_v4()));
-        let persist = (|| -> anyhow::Result<()> {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            #[cfg(test)]
-            self.fail_migration_at("write")?;
-            let mut file = options.open(&temporary)?;
-            file.write_all(yaml.as_bytes())?;
-            file.sync_all()?;
-            // Unlike rename, hard_link atomically refuses an existing target.
-            // Unsupported filesystems fail closed, leaving the source intact.
-            #[cfg(test)]
-            self.fail_migration_at("publish")?;
-            std::fs::hard_link(&temporary, &target)?;
-            Ok(())
-        })();
-        let _ = std::fs::remove_file(&temporary);
-        persist?;
-        cache.insert(to_id.to_string(), entry.clone());
-        #[cfg(unix)]
-        std::fs::File::open(&self.directory)?.sync_all()?;
-        // Once target publication succeeds, any cleanup error leaves TWO valid
-        // copies. Report failure (never first boot) and reconcile both caches.
-        anyhow::ensure!(
-            std::fs::read(&source)? == original,
-            "configuration source changed during migration; both copies retained"
-        );
-        #[cfg(test)]
-        self.fail_migration_at("delete")?;
-        std::fs::remove_file(&source)?;
-        cache.remove(from_id);
-        Ok(ConfigurationMigrateResult {
-            action: MigrateAction::Migrated,
-            entry: Some(entry),
-        })
+        self.migrate_entry(from_id, to_id).await
     }
 
     async fn set(&self, id: &str, value: Value) -> anyhow::Result<SetOutcome> {
@@ -662,6 +710,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_preserves_source_and_destination_on_failure() {
+        use crate::workers::configuration::store::ConfigurationStore;
+        for stage in ["write", "publish", "backup", "delete"] {
+            let dir = temp_dir();
+            let adapter = Arc::new(
+                FsAdapter::new(Some(json!({"directory": dir.path()})))
+                    .await
+                    .unwrap(),
+            );
+            let mut source = sample_entry("state");
+            source.value = json!({"raw": "${TOKEN}", "zero": 0, "null": null});
+            adapter.register(source.clone()).await.unwrap();
+            adapter
+                .register(sample_entry("default-state"))
+                .await
+                .unwrap();
+            let before = std::fs::read(adapter.entry_path("default-state")).unwrap();
+            let store = ConfigurationStore::new(adapter.clone());
+            store.prime_from_adapter().await.unwrap();
+            *adapter.migration_failure.lock().unwrap() = Some(stage);
+            assert!(store.migrate("state", "default-state").await.is_err());
+            assert_eq!(store.get("state").await.unwrap().value, source.value);
+            let committed = matches!(stage, "backup" | "delete");
+            assert_eq!(
+                store.get("default-state").await.unwrap().value,
+                if committed {
+                    source.value.clone()
+                } else {
+                    json!({"port": 3112})
+                }
+            );
+            if !committed {
+                assert_eq!(
+                    std::fs::read(adapter.entry_path("default-state")).unwrap(),
+                    before
+                );
+            }
+            *adapter.migration_failure.lock().unwrap() = None;
+            store.migrate("state", "default-state").await.unwrap();
+            assert!(store.get("state").await.is_none());
+            let target = adapter.entry_path("default-state");
+            let bytes = std::fs::read(&target).unwrap();
+            let modified = std::fs::metadata(&target).unwrap().modified().unwrap();
+            let count = std::fs::read_dir(dir.path()).unwrap().count();
+            assert_eq!(
+                store
+                    .migrate("state", "default-state")
+                    .await
+                    .unwrap()
+                    .action,
+                MigrateAction::Preserved
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), bytes);
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().modified().unwrap(),
+                modified
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), count);
+            let reloaded = FsAdapter::new(Some(json!({"directory": dir.path()})))
+                .await
+                .unwrap();
+            assert_eq!(reloaded.list().await.unwrap().len(), 1);
+            assert_eq!(
+                reloaded.get("default-state").await.unwrap().unwrap().value,
+                source.value
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn migration_preserves_top_level_false_zero_and_null() {
         for value in [json!(false), json!(0), Value::Null] {
             let dir = temp_dir();
@@ -686,7 +804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_preserves_both_files_when_target_exists_even_if_null() {
+    async fn migration_archives_source_and_replaces_target_even_if_null() {
         let dir = temp_dir();
         let adapter = FsAdapter::new(Some(json!({ "directory": dir.path() })))
             .await
@@ -695,16 +813,20 @@ mod tests {
         let mut target = sample_entry("new");
         target.value = Value::Null;
         adapter.register(target).await.unwrap();
-        let before: Vec<_> = ["old", "new"]
-            .map(|id| std::fs::read(adapter.entry_path(id)).unwrap())
-            .into();
+        let original = std::fs::read(adapter.entry_path("old")).unwrap();
         assert_eq!(
             adapter.migrate("old", "new").await.unwrap().action,
-            MigrateAction::Preserved
+            MigrateAction::Migrated
         );
-        for (id, bytes) in ["old", "new"].into_iter().zip(before) {
-            assert_eq!(std::fs::read(adapter.entry_path(id)).unwrap(), bytes);
-        }
+        assert!(!adapter.entry_path("old").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("old.yaml.bak")).unwrap(),
+            original
+        );
+        assert_eq!(
+            adapter.get("new").await.unwrap().unwrap().value,
+            json!({"port": 3112})
+        );
         assert_eq!(
             adapter.migrate("new", "new").await.unwrap().action,
             MigrateAction::Preserved
@@ -737,16 +859,12 @@ mod tests {
             assert_eq!(adapter.entry_path("new").exists(), published);
             assert_eq!(
                 std::fs::read_dir(dir.path()).unwrap().count(),
-                if published { 2 } else { 1 }
+                if published { 3 } else { 1 }
             );
             *adapter.migration_failure.lock().unwrap() = None;
             assert_eq!(
                 store.migrate("old", "new").await.unwrap().action,
-                if published {
-                    MigrateAction::Preserved
-                } else {
-                    MigrateAction::Migrated
-                }
+                MigrateAction::Migrated
             );
         }
     }
@@ -765,6 +883,92 @@ mod tests {
         std::fs::write(adapter.entry_path("old"), "invalid: [").unwrap();
         assert!(adapter.migrate("old", "new").await.is_err());
         assert!(!adapter.entry_path("new").exists());
+    }
+
+    #[tokio::test]
+    async fn migration_accepts_destination_id_in_legacy_file_but_rejects_unrelated_ids() {
+        use crate::workers::configuration::store::ConfigurationStore;
+        for target_exists in [false, true] {
+            let dir = temp_dir();
+            let config = Some(json!({"directory": dir.path()}));
+            let adapter = Arc::new(FsAdapter::new(config.clone()).await.unwrap());
+            if target_exists {
+                adapter
+                    .register(sample_entry("default-state"))
+                    .await
+                    .unwrap();
+            }
+            let mut source = sample_entry("default-state");
+            source.value = json!({"raw": "${TOKEN}", "enabled": false, "zero": 0, "empty": null});
+            source.metadata = Some(json!({"manual": true}));
+            let original = serde_yaml::to_string(&source).unwrap();
+            std::fs::write(dir.path().join("state.yaml"), &original).unwrap();
+            let store = ConfigurationStore::new(adapter.clone());
+            store.prime_from_adapter().await.unwrap();
+            store.migrate("state", "default-state").await.unwrap();
+            assert!(store.get("state").await.is_none());
+            assert_eq!(
+                store.get("default-state").await.unwrap().value,
+                source.value
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("state.yaml.bak")).unwrap(),
+                original
+            );
+            assert!(!dir.path().join("state.yaml").exists());
+            let reloaded = FsAdapter::new(config).await.unwrap();
+            let restored = reloaded.get("default-state").await.unwrap().unwrap();
+            assert_eq!(restored.value, source.value);
+            assert_eq!(restored.metadata, source.metadata);
+            assert_eq!(
+                store
+                    .migrate("state", "default-state")
+                    .await
+                    .unwrap()
+                    .action,
+                MigrateAction::Preserved
+            );
+            source.id = "unrelated".into();
+            std::fs::write(
+                dir.path().join("state.yaml"),
+                serde_yaml::to_string(&source).unwrap(),
+            )
+            .unwrap();
+            assert!(store.migrate("state", "default-state").await.is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("state.yaml.bak")).unwrap(),
+                original
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backups_are_ignored_on_load_watch_and_legacy_directory_migration() {
+        let dir = temp_dir();
+        let legacy = temp_dir();
+        let yaml = serde_yaml::to_string(&sample_entry("state")).unwrap();
+        for name in ["state.yaml.bak", "state.bak.yaml", "state.bkup.yaml"] {
+            std::fs::write(dir.path().join(name), &yaml).unwrap();
+            std::fs::write(legacy.path().join(name), &yaml).unwrap();
+        }
+        FsAdapter::migrate_dir(legacy.path(), dir.path()).await;
+        assert_eq!(std::fs::read_dir(legacy.path()).unwrap().count(), 3);
+        let adapter = FsAdapter::new(Some(json!({"directory": dir.path()})))
+            .await
+            .unwrap();
+        assert!(adapter.list().await.unwrap().is_empty());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter.watch(tx).await.unwrap();
+        for name in ["state.yaml.bak", "state.bak.yaml", "state.bkup.yaml"] {
+            std::fs::write(dir.path().join(name), &yaml).unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1200), rx.recv())
+                .await
+                .is_err()
+        );
+        assert!(adapter.list().await.unwrap().is_empty());
+        adapter.destroy().await.unwrap();
     }
 
     #[tokio::test]

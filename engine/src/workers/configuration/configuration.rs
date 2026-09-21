@@ -415,8 +415,19 @@ fn store_error_to_failure(err: StoreError) -> ErrorBody {
 #[service(name = "configuration")]
 impl ConfigurationWorker {
     #[function(
+        id = "configuration::migration-capabilities",
+        description = "Read-only migration contract negotiation. Revision 1 guarantees source priority and source archival; it does not migrate or write configuration."
+    )]
+    pub async fn migration_capabilities_fn(
+        &self,
+        _input: Value,
+    ) -> FunctionResult<Value, ErrorBody> {
+        FunctionResult::Success(serde_json::json!({"source_priority_archive_revision": 1}))
+    }
+
+    #[function(
         id = "configuration::migrate",
-        description = "Move an exact legacy configuration id to an absent destination at the authoritative store. Preserves raw values, schema and metadata; an existing destination wins and leaves the source untouched. Stop source consumers before migrating."
+        description = "Move an exact legacy configuration id at the authority, replacing the destination with the source and retaining the original source as a .yaml.bak backup. Missing source is a no-op. Stop consumers before migrating."
     )]
     pub async fn migrate_fn(
         &self,

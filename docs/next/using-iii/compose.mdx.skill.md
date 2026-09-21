@@ -745,16 +745,21 @@ migrate the exact hashed id produced by the previous algorithm for that namespac
 The filesystem adapter updates both filename and internal id, and the authority updates its caches
 and notifies subscribers. It re-reads the source so manual edits awaiting the watcher are retained.
 
-If the destination already exists, it wins, even when its value is null. Neither file is rewritten,
-and the source remains available for manual reconciliation. If neither exists, normal first boot
-continues without a placeholder entry. Repeating a completed migration performs no file writes.
-The exact previous hashed id is tried first. If both it and the destination are absent, the
-`default` namespace also tries the exact container key (`state` becomes `default-state`), unless
-another container explicitly owns that id. Other namespaces never adopt bare ids. Explicit
-`config_name` values are never auto-migrated. An existing destination always leaves the source intact.
+Migration gives the legacy source priority over an existing destination.
+After that, the `default` namespace adopts the exact bare container key (`state` becomes
+`default-state`), even when the destination already exists. The bare source replaces the
+whole destination entry, preserving raw values and metadata rather than merging defaults.
+Another container's explicit ownership blocks this adoption; other namespaces and explicit
+`config_name` values never adopt bare entries.
 
-Migration commits a complete destination without overwriting another file before deleting the
-source. I/O failures stop startup; failure after publication can leave two recoverable copies.
+After publishing the destination, the fs adapter archives the original source as
+`<source>.yaml.bak` (for example, `state.yaml.bak`). The previous destination is replaced,
+not backed up. Files ending in `.yaml.bak`, `.bak.yaml`, or `.bkup.yaml` are ignored during
+loading, watching, and legacy directory migration. Repeated starts with no source perform
+no writes. An existing identical backup permits recovery after interrupted cleanup; a
+conflicting backup is never overwritten and stops migration with an error.
+
+Migration commits the complete destination before archiving the source. I/O failures stop startup; failure after publication can leave two recoverable copies.
 The filesystem adapter requires same-directory hard-link support and may normalize YAML formatting
 or remove comments on the one migration rewrite; values and unknown document fields are retained.
 Stop source consumers before migration: Compose checks that the child is not already registered,

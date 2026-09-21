@@ -150,7 +150,7 @@ pub trait ConfigurationAdapter: Send + Sync {
         )
     }
 
-    /// Move at the authoritative store, preserving a pre-existing destination.
+    /// Move at the authoritative store with source priority, archiving the source.
     /// Implementations must preserve raw values and metadata, serialize with other
     /// mutations, and keep their cache recoverable on failure. No copy/delete fallback.
     async fn migrate(

@@ -2539,15 +2539,15 @@ async fn bridge_migration_uses_remote_authority_and_preserves_raw_cache() {
         })
         .await
     else {
-        panic!("remote target-wins failed")
+        panic!("remote source priority failed")
     };
-    assert_eq!(out.action, MigrateAction::Preserved);
-    assert!(out.entry.unwrap().value.is_null());
+    assert_eq!(out.action, MigrateAction::Migrated);
+    assert_eq!(out.entry.unwrap().value, json!({"source": true}));
     assert_eq!(
         call(
             port,
             "configuration::get",
-            json!({"id": "second-legacy", "raw": true})
+            json!({"id": "second-target", "raw": true})
         )
         .await
         .unwrap()["value"],
@@ -2619,10 +2619,10 @@ containers:
     child.shutdown_async().await;
 }
 
-/// Pre-namespace entries belong only to default; existing destinations win.
+/// Pre-namespace entries belong only to default and replace generated destinations.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn bare_config_migrates_only_when_default_destination_is_absent() {
+async fn bare_config_replaces_default_destination_and_preserves_backup() {
     isolate_state();
     for (namespace, target_exists) in [("default", false), ("default", true), ("orders", false)] {
         let storage = tempfile::tempdir().unwrap();
@@ -2685,11 +2685,7 @@ containers:
         let (result, child) = tokio::join!(up, ready);
         assert_eq!(result.unwrap()["status"], "ok");
         if namespace == "default" {
-            let expected = if target_exists {
-                json!({"target": true})
-            } else {
-                raw.clone()
-            };
+            let expected = raw.clone();
             let delivered: Value = serde_yaml::from_slice(
                 &std::fs::read(tmp.path().join("workers/state/delivered")).unwrap(),
             )
@@ -2710,7 +2706,7 @@ containers:
             )
             .unwrap();
             assert_eq!(entry["id"], target);
-            if !target_exists {
+            {
                 assert_eq!(entry["metadata"], json!({"manual": true}));
                 assert!(!storage.path().join("state.yaml").exists());
                 assert!(
@@ -2727,7 +2723,19 @@ containers:
         } else {
             assert!(!storage.path().join(format!("{target}.yaml")).exists());
         }
-        if target_exists || namespace != "default" {
+        if namespace == "default" {
+            let backups: Vec<_> = std::fs::read_dir(storage.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "bak"))
+                .collect();
+            assert_eq!(backups.len(), 1);
+            let backup: Value =
+                serde_yaml::from_slice(&std::fs::read(&backups[0]).unwrap()).unwrap();
+            assert_eq!(backup["value"], raw);
+            assert_eq!(std::fs::read(&backups[0]).unwrap(), before);
+        }
+        if namespace != "default" {
             assert_eq!(
                 std::fs::read(storage.path().join("state.yaml")).unwrap(),
                 before
@@ -2735,5 +2743,64 @@ containers:
         }
         daemon.shutdown().await;
         child.shutdown_async().await;
+    }
+}
+
+/// An old authority may accept migrate but still implement target-wins.
+/// Both callers must reject it before invoking that mutating function.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_rejects_unknown_authority_contract_before_writing() {
+    use iii::workers::configuration::adapters::{ConfigurationAdapter, bridge::BridgeAdapter};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    isolate_state();
+    for advertised in [
+        None,
+        Some(json!({})),
+        Some(json!({"source_priority_archive_revision": 0})),
+    ] {
+        let port = spawn_engine_with_configuration(false).await;
+        let authority = register_test_worker(port, "default", "old-authority");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        authority.register_function(
+            "configuration::migrate",
+            RegisterFunction::new_async(move |_input: Value| {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"action": "preserved", "entry": null}))
+                }
+            }),
+        );
+        if let Some(capabilities) = advertised {
+            authority.register_function(
+                "configuration::migration-capabilities",
+                RegisterFunction::new_async(move |_input: Value| {
+                    let capabilities = capabilities.clone();
+                    async move { Ok(capabilities) }
+                }),
+            );
+        }
+        let address = format!("ws://127.0.0.1:{port}");
+        let compose =
+            iii_compose::engine::EngineClient::connect(&address, "compatibility-test", "default");
+        assert_eq!(
+            compose
+                .migrate_config("old", "new")
+                .await
+                .unwrap_err()
+                .code(),
+            "CONFIG_MIGRATION_FAILED"
+        );
+        let bridge = BridgeAdapter::new(address).await.unwrap();
+        let error = bridge.migrate("old", "new").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("upgrade remote configuration authority")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        bridge.destroy().await.unwrap();
+        authority.shutdown_async().await;
     }
 }
